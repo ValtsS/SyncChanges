@@ -6,6 +6,7 @@ using System.Collections.Generic;
 using System.Data.Common;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace SyncChanges
 {
@@ -106,7 +107,7 @@ namespace SyncChanges
                 var replicationSet = Config.ReplicationSets[i];
                 var tables = Tables[i];
 
-                Sync(replicationSet, tables);
+                Sync(replicationSet, tables, replicationSet.ForceFullReload.GetValueOrDefault(false));
             }
 
             Log.Info($"Finished replication {(Error ? "with" : "without")} errors");
@@ -114,7 +115,7 @@ namespace SyncChanges
             return !Error;
         }
 
-        private bool Sync(ReplicationSet replicationSet, IList<TableInfo> tables, long sourceVersion = -1)
+        private bool Sync(ReplicationSet replicationSet, IList<TableInfo> tables, bool fullReload = false,  long sourceVersion = -1)
         {
             Error = false;
 
@@ -126,7 +127,15 @@ namespace SyncChanges
                 .Where(d => d.Key >= 0 && (sourceVersion < 0 || d.Key < sourceVersion)).ToList();
 
             foreach (var destinations in destinationsByVersion)
-                Replicate(replicationSet.Source, destinations, tables);
+            {
+                if (fullReload)
+                {
+                    foreach (var dest in destinations)
+                        FullLoadReplicate(replicationSet.Source, dest, tables);
+                }
+                else
+                    Replicate(replicationSet.Source, destinations, tables);
+            }
 
             return !Error;
         }
@@ -170,7 +179,7 @@ namespace SyncChanges
                             Log.Info($"Current version of source in replication set {replicationSet.Name} has increased from {currentVersion} to {version}: Starting replication.");
 
                             var tables = Tables[i];
-                            var success = Sync(replicationSet, tables, version);
+                            var success = Sync(replicationSet, tables, false, version);
 
                             if (success) currentVersions[i] = version;
 
@@ -304,6 +313,126 @@ namespace SyncChanges
             if (Timeout != 0) db.CommandTimeout = Timeout;
 
             return db;
+        }
+
+        private ResultsBuffer AllocBufferForFull(TableInfo table)
+        {
+            List<string> cols = new();
+
+            for (int i = 0; i < table.KeyColumns.Count; i++)
+                cols.Add(table.KeyColumns[i]);
+            for (int i = 0; i < table.OtherColumns.Count; i++)
+                cols.Add(table.OtherColumns[i]);
+
+            return new ResultsBuffer(cols.ToArray());
+        }
+
+        private async Task<bool> Save(Database db, ResultsBuffer buffer, TableInfo table)
+        {
+            try
+            {
+                var insertSql = string.Format("insert into {0} ({1}) values ({2})", table.Name,
+                                string.Join(", ", buffer.Columns),
+                                string.Join(", ", Parameters(buffer.Columns.Length)));
+
+                int count = buffer.Count;
+
+                while (buffer.Lines.Count > 0)
+                {
+                    object[] data = buffer.Lines.Dequeue();
+                    Log.Debug($"Executing insert: {insertSql} ({FormatArgs(data)})");
+                    await db.ExecuteAsync(insertSql, data);
+                }
+
+                Log.Info($"Saved {count} entries to {table.Name}");
+                return true;
+            } catch (Exception ex)
+            {
+                Log.Error(ex);
+                return false;
+            }
+
+        }
+
+        private void FullLoadReplicate(DatabaseInfo source, DatabaseInfo destination, IList<TableInfo> tables)
+        {
+
+            using var dbDest = GetDatabase(destination.ConnectionString, DatabaseType.SqlServer2005);
+            using var dbSrc = GetDatabase(source.ConnectionString, DatabaseType.SqlServer2008);
+
+            var snapshotIsolationEnabled = dbSrc.ExecuteScalar<int>("select snapshot_isolation_state from sys.databases where name = DB_NAME()") == 1;
+            if (!snapshotIsolationEnabled)
+            {
+                Log.Error($"Snapshot isolation is not enabled in database {source.Name}, need it to have it enabled");
+            }
+
+            using var transSrc = dbSrc.GetTransaction(System.Data.IsolationLevel.Snapshot);
+
+            var currentVer = dbSrc.ExecuteScalar<long>("select CHANGE_TRACKING_CURRENT_VERSION()");
+            Log.Info($"Current version of database {source.Name} is {currentVer}");
+
+            VerifyChangeTrackingPresence(tables, dbSrc);
+
+            foreach (TableInfo table in tables)
+            {
+
+                dbDest.Execute($"truncate table {table.Name}");
+
+                var sql = $@"select {string.Join(", ", table.KeyColumns.Select(c => "t." + c).Concat(table.OtherColumns.Select(c => "t." + c)))}
+                            from {table.Name} t";
+
+                dbSrc.OpenSharedConnection();
+                var cmd = dbSrc.CreateCommand(dbSrc.Connection, System.Data.CommandType.Text, sql);
+
+                using var reader = cmd.ExecuteReader();
+                var numChanges = 0;
+
+                ResultsBuffer buffer = null;
+                Task<bool> saver = null;
+
+                while (reader.Read())
+                {
+                    if (buffer == null)
+                        buffer = AllocBufferForFull(table);
+                    buffer.ReadLine(reader);
+                    if (buffer.Count >= 1000)
+                    {
+                        WaitForSave(saver);
+                        var saveBuffer = buffer;
+                        buffer = null;
+                        saver = Task.Run<bool>(() => Save(dbDest, saveBuffer, table));
+                    }
+                    numChanges++;
+                }
+                WaitForSave(saver);
+                if (buffer != null)
+                {
+                    saver = Save(dbDest, buffer, table);
+                    WaitForSave(saver);
+                }
+            }
+            SetSyncVersion(dbDest, currentVer);
+        }
+
+        private static void VerifyChangeTrackingPresence(IList<TableInfo> tables, Database dbSrc)
+        {
+            foreach (TableInfo table in tables)
+            {
+                var minVersion = dbSrc.ExecuteScalar<long?>("select CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID(@0))", table.Name);
+                if (!minVersion.HasValue)
+                {
+                    Log.Error($"Table {table.Name} does not have change tracking enabled");
+                }
+            }
+        }
+
+        private static void WaitForSave(Task<bool> saver)
+        {
+            if (saver == null)
+                return;
+            saver.Wait();
+            if (!saver.Result)
+                throw new Exception($"Saver failed {saver.Exception}");
         }
 
         private void Replicate(DatabaseInfo source, IGrouping<long, DatabaseInfo> destinations, IList<TableInfo> tables)

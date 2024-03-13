@@ -56,6 +56,10 @@ namespace SyncChanges
         /// The tables to be replicated.
         /// </value>
         public List<string> Tables { get; set; } = new List<string>();
+        /// <summary>
+        /// Used for first sync when the option of backup and restore is not possible.
+        /// </summary>
+        public bool? ForceFullReload { get; set; }
     }
 
     /// <summary>
