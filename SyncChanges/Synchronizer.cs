@@ -331,9 +331,13 @@ namespace SyncChanges
         {
             try
             {
+
                 var insertSql = string.Format("insert into {0} ({1}) values ({2})", table.Name,
                                 string.Join(", ", buffer.Columns),
                                 string.Join(", ", Parameters(buffer.Columns.Length)));
+
+                if (table.HasIdentity)
+                    insertSql = $"set IDENTITY_INSERT {table.Name} ON; {insertSql}; set IDENTITY_INSERT {table.Name} OFF";
 
                 int count = buffer.Count;
 
