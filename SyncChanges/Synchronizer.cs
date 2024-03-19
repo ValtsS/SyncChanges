@@ -576,7 +576,7 @@ namespace SyncChanges
                 }
                 else
                 {
-                    db.Execute("update SyncInfo set Version = @0", currentVersion);
+                    db.Execute("update SyncInfo set Version = @0, TablesList = @1", currentVersion, SerializeList(tables));
                 }
             }
         }
