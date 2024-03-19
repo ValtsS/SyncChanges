@@ -6,6 +6,7 @@ using System;
 using System.Collections.Generic;
 using System.Data.Common;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
@@ -125,18 +126,33 @@ namespace SyncChanges
 
             Log.Info($"Starting replication for replication set {replicationSet.Name}");
 
-            var destinationsByVersion = replicationSet.Destinations.GroupBy(d => GetCurrentVersion(d, tables.Select(x => x.Name).ToArray()))
-                .Where(d => d.Key >= 0 && (sourceVersion < 0 || d.Key < sourceVersion)).ToList();
 
-            foreach (var destinations in destinationsByVersion)
+            Dictionary<string, List<DatabaseInfo>> byVersion = new();
+
+            foreach( var d in replicationSet.Destinations)
             {
+                var verData = GetCurrentVersion(d, tables.Select(x => x.Name).ToArray()).Select(kv => $"{kv.Key}:{kv.Value};").ToList();
+                verData.Sort();
+                var dstring = String.Join("", verData);
+
+                if (!byVersion.ContainsKey(dstring))
+                        byVersion.Add(dstring, new List<DatabaseInfo>());
+                byVersion[dstring].Add(d);
+            }
+
+            foreach (var destSet in byVersion)
+            {
+                var versionData = GetCurrentVersion(destSet.Value[0], tables.Select(x => x.Name).ToArray());
+
                 if (fullReload)
                 {
-                    foreach (var dest in destinations)
+                    foreach (var dest in destSet.Value)
                         FullLoadReplicate(replicationSet.Source, dest, tables);
                 }
                 else
-                    Replicate(replicationSet.Source, destinations, tables);
+                    Replicate(replicationSet.Source, destSet.Value, versionData, tables);
+
+
             }
 
             return !Error;
@@ -372,6 +388,7 @@ namespace SyncChanges
             if (!snapshotIsolationEnabled)
             {
                 Log.Error($"Snapshot isolation is not enabled in database {source.Name}, need it to have it enabled");
+                return;
             }
 
             using (var transSrc = dbSrc.GetTransaction(System.Data.IsolationLevel.Snapshot))
@@ -444,13 +461,13 @@ namespace SyncChanges
                 throw new Exception($"Saver failed {saver.Exception}");
         }
 
-        private void Replicate(DatabaseInfo source, IGrouping<long, DatabaseInfo> destinations, IList<TableInfo> tables)
+        private void Replicate(DatabaseInfo source, List<DatabaseInfo> destinations, Dictionary<string, long> versions, IList<TableInfo> tables)
         {
-            var changeInfo = RetrieveChanges(source, destinations, tables);
+            var changeInfo = RetrieveChangesEx(source, versions, tables);
             if (changeInfo == null) return;
 
             // replicate changes to destinations
-            foreach (var destination in destinations)
+            foreach(var destination in destinations)
             {
                 try
                 {
@@ -654,6 +671,119 @@ namespace SyncChanges
             return changeInfo;
         }
 
+        private ChangeInfo RetrieveChangesEx(DatabaseInfo source, Dictionary<string, long> versions, IList<TableInfo> tables)
+        {
+
+            var changeInfo = new ChangeInfo();
+            var changes = new List<Change>();
+
+            using (var db = GetDatabase(source.ConnectionString, DatabaseType.SqlServer2008))
+            {
+                var snapshotIsolationEnabled = db.ExecuteScalar<int>("select snapshot_isolation_state from sys.databases where name = DB_NAME()") == 1;
+                if (snapshotIsolationEnabled)
+                {
+                    Log.Info($"Snapshot isolation is enabled in database {source.Name}");
+                    db.BeginTransaction(System.Data.IsolationLevel.Snapshot);
+                }
+                else
+                {
+                    string messageIsolationRequired = $"Snapshot isolation is not enabled in database {source.Name}, need it to have it enabled";
+                    Log.Error(messageIsolationRequired);
+                    Error = true;
+                    return null;
+                }
+
+                changeInfo.Version = db.ExecuteScalar<long>("select CHANGE_TRACKING_CURRENT_VERSION()");
+                Log.Info($"Current version of database {source.Name} is {changeInfo.Version}");
+
+                foreach (var table in tables)
+                {
+                    var tableName = table.Name;
+                    var minVersion = db.ExecuteScalar<long?>("select CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID(@0))", tableName);
+
+                    Log.Info($"Minimum version of table {tableName} in database {source.Name} is {minVersion}");
+
+                    var destinationVersion = versions[table.Name];
+                    bool loadFull = (minVersion > destinationVersion);
+
+                    if (loadFull)
+                    {
+                        Log.Warn($"Cannot replicate table {tableName} because minimum source version {minVersion} is greater than destination version {destinationVersion}. Attempting full load!");
+                        loadFull = true;
+                    }
+
+                    string sql;
+
+                    if (loadFull)
+                    {
+                        Log.Info($"Scheduling truncate in table {tableName}");
+                        changes.Add(new Change { Operation = 'T', Table = table, Version = changeInfo.Version - 1 });
+                        sql = $@"select {string.Join(", ", table.KeyColumns.Select(c => "t." + c).Concat(table.OtherColumns.Select(c => "t." + c)))}
+                            from {table.Name} t";
+                    } else
+                    {
+                        sql = $@"select c.SYS_CHANGE_OPERATION, c.SYS_CHANGE_VERSION, c.SYS_CHANGE_CREATION_VERSION,
+                        {string.Join(", ", table.KeyColumns.Select(c => "c." + c).Concat(table.OtherColumns.Select(c => "t." + c)))}
+                        from CHANGETABLE (CHANGES {tableName}, @0) c
+                        left outer join {tableName} t on ";
+                        sql += string.Join(" and ", table.KeyColumns.Select(k => $"c.{k} = t.{k}"));
+                        sql += " order by coalesce(c.SYS_CHANGE_CREATION_VERSION, c.SYS_CHANGE_VERSION)";
+                    }
+
+                    Log.Debug($"Retrieving changes for table {tableName}: {sql}");
+
+                    db.OpenSharedConnection();
+                    var cmd = db.CreateCommand(db.Connection, System.Data.CommandType.Text, sql, destinationVersion);
+
+                    using var reader = cmd.ExecuteReader();
+                    var numChanges = 0;
+
+                    while (reader.Read())
+                    {
+
+                        var col = 0;
+
+                        Change change = null;
+
+                        if (!loadFull)
+                        {
+                            change = new Change { Operation = ((string)reader[col])[0], Table = table };
+                            col++;
+                            var version = reader.GetInt64(col);
+                            change.Version = version;
+                            col++;
+                            var creationVersion = reader.IsDBNull(col) ? version : reader.GetInt64(col);
+                            change.CreationVersion = creationVersion;
+                            col++;
+                        } else
+                        {
+                            change = new Change { Operation = 'I', Table = table, Version = changeInfo.Version };
+                        }
+
+                        for (int i = 0; i < table.KeyColumns.Count; i++, col++)
+                            change.Keys[table.KeyColumns[i]] = reader.GetValue(col);
+                        for (int i = 0; i < table.OtherColumns.Count; i++, col++)
+                            change.Others[table.OtherColumns[i]] = reader.GetValue(col);
+
+                        changes.Add(change);
+                        numChanges++;
+                    }
+
+                    Log.Info($"Table {tableName} has {"change".ToQuantity(numChanges)}");
+                }
+
+                if (snapshotIsolationEnabled)
+                    db.CompleteTransaction();
+            }
+
+            changeInfo.Changes.AddRange(changes.OrderBy(c => c.Version).ThenBy(c => c.Table.Name));
+
+            ComputeForeignKeyConstraintsToDisable(changeInfo);
+
+            return changeInfo;
+        }
+
+
         private void ComputeForeignKeyConstraintsToDisable(ChangeInfo changeInfo)
         {
             var changes = changeInfo.Changes.OrderBy(c => c.CreationVersion).ThenBy(c => c.Table.Name).ToList();
@@ -729,6 +859,14 @@ namespace SyncChanges
                     if (!DryRun)
                         db.Execute(deleteSql, deleteValues);
                     break;
+                // Truncate - actually artificial for full re-load
+                case 'T':
+                    var truncateSql = string.Format("truncate table {0}", tableName);
+                    Log.Debug($"Executing truncate: {truncateSql}");
+                    if (!DryRun)
+                        db.Execute(truncateSql);
+
+                    break;
             }
         }
 
@@ -739,9 +877,14 @@ namespace SyncChanges
 
         private static IEnumerable<string> Parameters(int n) => Enumerable.Range(0, n).Select(c => "@" + c);
 
-        private long GetCurrentVersion(DatabaseInfo dbInfo, string[] TablesList)
+        private Dictionary<string, long> GetCurrentVersion(DatabaseInfo dbInfo, string[] TablesList)
         {
-            var requiredSet = new HashSet<string>(TablesList);
+            var answer = new Dictionary<string, long>();
+
+            foreach(var t in TablesList)
+            {
+                answer[t] = 0;
+            }
 
             try
             {
@@ -751,15 +894,7 @@ namespace SyncChanges
 
                 if (!syncInfoTableExists)
                 {
-                    Log.Info($"SyncInfo table does not exist in database {dbInfo.Name}");
-                    currentVersion = db.ExecuteScalar<long?>("select CHANGE_TRACKING_CURRENT_VERSION()") ?? -1;
-                    if (currentVersion < 0)
-                    {
-                        Log.Info($"Change tracking not enabled in database {dbInfo.Name}, assuming version 0");
-                        currentVersion = 0;
-                    }
-                    else
-                        Log.Info($"Database {dbInfo.Name} is at version {currentVersion}");
+                    Log.Info($"SyncInfo table does not exist in database {dbInfo.Name}, assuming version 0");
                 }
                 else
                 {
@@ -769,25 +904,19 @@ namespace SyncChanges
                     db.CompleteTransaction();
                     var recordedTables = JsonConvert.DeserializeObject<string[]>(tablesStored);
 
-                    var recordedSet = new HashSet<string>(recordedTables);
-
-                    if (requiredSet.IsSubsetOf(recordedSet))
-                        Log.Info($"Database {dbInfo.Name} is at version {currentVersion}");
-                    else
+                    foreach(var t in recordedTables)
                     {
-                        currentVersion = 0;
-                        Log.Info($"Tables config in database {dbInfo.Name} has changed, setting version {currentVersion}");
+                        answer[t] = currentVersion;
                     }
                 }
-
-                return currentVersion;
+                return answer;
             }
 #pragma warning disable CA1031 // Do not catch general exception types
             catch (Exception ex)
             {
                 Log.Error(ex, $"Error getting current version of destination database {dbInfo.Name}. Skipping this destination.");
                 Error = true;
-                return -1;
+                return [];
             }
 #pragma warning restore CA1031 // Do not catch general exception types
         }
