@@ -359,6 +359,8 @@ namespace SyncChanges
                 if (table.HasIdentity)
                     insertSql = $"set IDENTITY_INSERT {table.Name} ON; {insertSql}; set IDENTITY_INSERT {table.Name} OFF";
 
+
+
                 int count = buffer.Count;
 
                 while (buffer.Lines.Count > 0)
@@ -376,6 +378,17 @@ namespace SyncChanges
                 return false;
             }
 
+        }
+
+        private void ToggleForgeignConstraints(Database db, IEnumerable<ForeignKeyConstraint> constraints, bool Enabled)
+        {
+            foreach (ForeignKeyConstraint constraint in constraints)
+            {
+                if (Enabled)
+                    ReenableForeignKeyConstraint(db, constraint);
+                else
+                    DisableForeignKeyConstraint(db, constraint);
+            }
         }
 
         private void FullLoadReplicate(DatabaseInfo source, DatabaseInfo destination, IList<TableInfo> tables)
@@ -398,43 +411,51 @@ namespace SyncChanges
 
                 VerifyChangeTrackingPresence(tables, dbSrc);
 
-                foreach (TableInfo table in tables)
+                var constraints = tables.SelectMany(x => x.ForeignKeyConstraints).Distinct().ToList();
+
+                ToggleForgeignConstraints(dbDest, constraints, false);
+                try
                 {
 
-                    dbDest.Execute($"truncate table {table.Name}");
-
-                    var sql = $@"select {string.Join(", ", table.KeyColumns.Select(c => "t." + c).Concat(table.OtherColumns.Select(c => "t." + c)))}
+                    foreach (TableInfo table in tables)
+                    {
+                        var sql = $@"select {string.Join(", ", table.KeyColumns.Select(c => "t." + c).Concat(table.OtherColumns.Select(c => "t." + c)))}
                             from {table.Name} t";
 
-                    dbSrc.OpenSharedConnection();
-                    var cmd = dbSrc.CreateCommand(dbSrc.Connection, System.Data.CommandType.Text, sql);
+                        dbSrc.OpenSharedConnection();
+                        var cmd = dbSrc.CreateCommand(dbSrc.Connection, System.Data.CommandType.Text, sql);
 
-                    using var reader = cmd.ExecuteReader();
-                    var numChanges = 0;
+                        using var reader = cmd.ExecuteReader();
+                        var numChanges = 0;
 
-                    ResultsBuffer buffer = null;
-                    Task<bool> saver = null;
+                        ResultsBuffer buffer = null;
+                        Task<bool> saver = null;
 
-                    while (reader.Read())
-                    {
-                        if (buffer == null)
-                            buffer = AllocBufferForFull(table);
-                        buffer.ReadLine(reader);
-                        if (buffer.Count >= 1000)
+                        while (reader.Read())
                         {
-                            WaitForSave(saver);
-                            var saveBuffer = buffer;
-                            buffer = null;
-                            saver = Task.Run<bool>(() => Save(dbDest, saveBuffer, table));
+                            if (buffer == null)
+                                buffer = AllocBufferForFull(table);
+                            buffer.ReadLine(reader);
+                            if (buffer.Count >= 1000)
+                            {
+                                WaitForSave(saver);
+                                var saveBuffer = buffer;
+                                buffer = null;
+                                saver = Task.Run<bool>(() => Save(dbDest, saveBuffer, table));
+                            }
+                            numChanges++;
                         }
-                        numChanges++;
-                    }
-                    WaitForSave(saver);
-                    if (buffer != null)
-                    {
-                        saver = Save(dbDest, buffer, table);
                         WaitForSave(saver);
+                        if (buffer != null)
+                        {
+                            saver = Save(dbDest, buffer, table);
+                            WaitForSave(saver);
+                        }
                     }
+                }
+                finally
+                {
+                    ToggleForgeignConstraints(dbDest, constraints, true);
                 }
                 SetSyncVersion(dbDest, currentVer, tables.Select(x => x.Name).ToArray());
             }
