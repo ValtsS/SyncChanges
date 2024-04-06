@@ -404,21 +404,21 @@ namespace SyncChanges
                 return;
             }
 
+            var destTables = GetTables(destination);
+
             using (var transSrc = dbSrc.GetTransaction(System.Data.IsolationLevel.Snapshot))
             {
                 var currentVer = dbSrc.ExecuteScalar<long>("select CHANGE_TRACKING_CURRENT_VERSION()");
                 Log.Info($"Current version of database {source.Name} is {currentVer}");
 
                 VerifyChangeTrackingPresence(tables, dbSrc);
-
-                var constraints = tables.SelectMany(x => x.ForeignKeyConstraints).Distinct().ToList();
-
+                var constraints = destTables.SelectMany(x => x.ForeignKeyConstraints).Distinct().ToList();
                 ToggleForgeignConstraints(dbDest, constraints, false);
                 try
                 {
-
                     foreach (TableInfo table in tables)
                     {
+                        dbDest.Execute($"truncate table {table.Name}");
                         var sql = $@"select {string.Join(", ", table.KeyColumns.Select(c => "t." + c).Concat(table.OtherColumns.Select(c => "t." + c)))}
                             from {table.Name} t";
 
