@@ -255,28 +255,7 @@ namespace SyncChanges
                         OtherColumns = g.Where(c => (int)c.PrimaryKey == 0).Select(c => (string)c.ColumnName).ToList(),
                         HasIdentity = g.Any(c => (int)c.IsIdentity > 0)
                     }).ToList();
-
-                var fks = db.Fetch<ForeignKeyConstraint>(@"select obj.name AS ForeignKeyName,
-                            ('[' + sch.name + '].[' + tab1.name + ']') TableName,
-                            ('[' +  col1.name + ']') ColumnName,
-                            ('[' + sch2.name + '].[' + tab2.name + ']') ReferencedTableName,
-                            ('[' +  col2.name + ']') ReferencedColumnName
-                        from sys.foreign_key_columns fkc
-                        inner join sys.foreign_keys obj
-                            on obj.object_id = fkc.constraint_object_id
-                        inner join sys.tables tab1
-                            on tab1.object_id = fkc.parent_object_id
-                        inner join sys.schemas sch
-                            on tab1.schema_id = sch.schema_id
-                        inner join sys.columns col1
-                            on col1.column_id = parent_column_id AND col1.object_id = tab1.object_id
-                        inner join sys.tables tab2
-                            on tab2.object_id = fkc.referenced_object_id
-                        inner join sys.schemas sch2
-                            on tab2.schema_id = sch2.schema_id
-                        inner join sys.columns col2
-                            on col2.column_id = referenced_column_id AND col2.object_id = tab2.object_id
-                        where obj.is_disabled = 0");
+                List<ForeignKeyConstraint> fks = GetAllEnabledConstraints(db);
 
                 foreach (var table in tables)
                     table.ForeignKeyConstraints = fks.Where(f => f.TableName == table.Name).ToList();
@@ -322,6 +301,38 @@ namespace SyncChanges
                 Log.Fatal(ex, "Error getting tables to replicate from source database");
                 throw;
             }
+        }
+
+        private static List<ForeignKeyConstraint> GetAllConstraints(Database db)
+        {
+
+            return db.Fetch<ForeignKeyConstraint>(@"select obj.name AS ForeignKeyName,
+                            ('[' + sch.name + '].[' + tab1.name + ']') TableName,
+                            ('[' +  col1.name + ']') ColumnName,
+                            ('[' + sch2.name + '].[' + tab2.name + ']') ReferencedTableName,
+                            ('[' +  col2.name + ']') ReferencedColumnName,
+                            obj.is_disabled as IsDisabled
+                        from sys.foreign_key_columns fkc
+                        inner join sys.foreign_keys obj
+                            on obj.object_id = fkc.constraint_object_id
+                        inner join sys.tables tab1
+                            on tab1.object_id = fkc.parent_object_id
+                        inner join sys.schemas sch
+                            on tab1.schema_id = sch.schema_id
+                        inner join sys.columns col1
+                            on col1.column_id = parent_column_id AND col1.object_id = tab1.object_id
+                        inner join sys.tables tab2
+                            on tab2.object_id = fkc.referenced_object_id
+                        inner join sys.schemas sch2
+                            on tab2.schema_id = sch2.schema_id
+                        inner join sys.columns col2
+                            on col2.column_id = referenced_column_id AND col2.object_id = tab2.object_id"
+                        );
+        }
+
+        private static List<ForeignKeyConstraint> GetAllEnabledConstraints(Database db)
+        {
+            return GetAllConstraints(db).Where(x => x.IsDisabled != 1).ToList();
         }
 
         private Database GetDatabase(string connectionString, DatabaseType databaseType = null)
@@ -404,7 +415,6 @@ namespace SyncChanges
                 return;
             }
 
-            var destTables = GetTables(destination);
 
             using (var transSrc = dbSrc.GetTransaction(System.Data.IsolationLevel.Snapshot))
             {
@@ -412,52 +422,71 @@ namespace SyncChanges
                 Log.Info($"Current version of database {source.Name} is {currentVer}");
 
                 VerifyChangeTrackingPresence(tables, dbSrc);
-                var constraints = destTables.SelectMany(x => x.ForeignKeyConstraints).Distinct().ToList();
-                ToggleForgeignConstraints(dbDest, constraints, false);
+
+                var involvedTables = new HashSet<string>(tables.Select(t => t.Name));
+                var destConstraints = GetAllConstraints(dbDest).ToList();
+                var constraintsToDisable = GetAllEnabledConstraints(dbDest).Where(c => involvedTables.Contains(c.TableName) && c.IsDisabled != 1).ToList();
+
+                ToggleForgeignConstraints(dbDest, constraintsToDisable, false);
                 try
                 {
-                    foreach (TableInfo table in tables)
-                    {
-                        dbDest.Execute($"truncate table {table.Name}");
-                        var sql = $@"select {string.Join(", ", table.KeyColumns.Select(c => "t." + c).Concat(table.OtherColumns.Select(c => "t." + c)))}
-                            from {table.Name} t";
-
-                        dbSrc.OpenSharedConnection();
-                        var cmd = dbSrc.CreateCommand(dbSrc.Connection, System.Data.CommandType.Text, sql);
-
-                        using var reader = cmd.ExecuteReader();
-                        var numChanges = 0;
-
-                        ResultsBuffer buffer = null;
-                        Task<bool> saver = null;
-
-                        while (reader.Read())
-                        {
-                            if (buffer == null)
-                                buffer = AllocBufferForFull(table);
-                            buffer.ReadLine(reader);
-                            if (buffer.Count >= 1000)
-                            {
-                                WaitForSave(saver);
-                                var saveBuffer = buffer;
-                                buffer = null;
-                                saver = Task.Run<bool>(() => Save(dbDest, saveBuffer, table));
-                            }
-                            numChanges++;
-                        }
-                        WaitForSave(saver);
-                        if (buffer != null)
-                        {
-                            saver = Save(dbDest, buffer, table);
-                            WaitForSave(saver);
-                        }
-                    }
+                    TransferAllTables(tables, dbDest, dbSrc, destConstraints);
+                    SetSyncVersion(dbDest, currentVer, tables.Select(x => x.Name).ToArray());
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, $"Full re-load failed, you will likely need to re-start from scratch. Destination {destination.Name} state uncertain");
+                    Error = true;
                 }
                 finally
                 {
-                    ToggleForgeignConstraints(dbDest, constraints, true);
+                    ToggleForgeignConstraints(dbDest, constraintsToDisable, true);
                 }
-                SetSyncVersion(dbDest, currentVer, tables.Select(x => x.Name).ToArray());
+
+            }
+        }
+
+        private void TransferAllTables(IList<TableInfo> tables, Database dbDest, Database dbSrc, List<ForeignKeyConstraint> destForeignKeyConstraints)
+        {
+            var tablesWithFK = new HashSet<string>(destForeignKeyConstraints.Select(x => x.TableName));
+
+            foreach (TableInfo table in tables)
+            {
+                string sqlClean = tablesWithFK.Contains(table.Name) ? "delete from" : "truncate table";
+                dbDest.Execute($"{sqlClean} {table.Name}");
+
+                var sql = $@"select {string.Join(", ", table.KeyColumns.Select(c => "t." + c).Concat(table.OtherColumns.Select(c => "t." + c)))}
+                            from {table.Name} t";
+
+                dbSrc.OpenSharedConnection();
+                var cmd = dbSrc.CreateCommand(dbSrc.Connection, System.Data.CommandType.Text, sql);
+
+                using var reader = cmd.ExecuteReader();
+                var numChanges = 0;
+
+                ResultsBuffer buffer = null;
+                Task<bool> saver = null;
+
+                while (reader.Read())
+                {
+                    if (buffer == null)
+                        buffer = AllocBufferForFull(table);
+                    buffer.ReadLine(reader);
+                    if (buffer.Count >= 1000)
+                    {
+                        WaitForSave(saver);
+                        var saveBuffer = buffer;
+                        buffer = null;
+                        saver = Task.Run<bool>(() => Save(dbDest, saveBuffer, table));
+                    }
+                    numChanges++;
+                }
+                WaitForSave(saver);
+                if (buffer != null)
+                {
+                    saver = Save(dbDest, buffer, table);
+                    WaitForSave(saver);
+                }
             }
         }
 

@@ -10,6 +10,7 @@ namespace SyncChanges
         public string ReferencedColumnName { get; set; }
         public string ForeignKeyName { get; set; }
         public string FullName => TableName + ":" + ForeignKeyName;
+        public int IsDisabled { get; set; }
 
         public override bool Equals(Object obj)
         {
