@@ -425,7 +425,7 @@ namespace SyncChanges
 
                 var involvedTables = new HashSet<string>(tables.Select(t => t.Name));
                 var destConstraints = GetAllConstraints(dbDest).ToList();
-                var constraintsToDisable = GetAllEnabledConstraints(dbDest).Where(c => involvedTables.Contains(c.TableName) && c.IsDisabled != 1).ToList();
+                var constraintsToDisable = GetAllEnabledConstraints(dbDest).Where(c => (involvedTables.Contains(c.TableName) || involvedTables.Contains(c.ReferencedTableName)) && c.IsDisabled != 1).ToList();
 
                 ToggleForgeignConstraints(dbDest, constraintsToDisable, false);
                 try
@@ -448,7 +448,7 @@ namespace SyncChanges
 
         private void TransferAllTables(IList<TableInfo> tables, Database dbDest, Database dbSrc, List<ForeignKeyConstraint> destForeignKeyConstraints)
         {
-            var tablesWithFK = new HashSet<string>(destForeignKeyConstraints.Select(x => x.TableName));
+            var tablesWithFK = new HashSet<string>(destForeignKeyConstraints.Select(x => x.TableName).Union(destForeignKeyConstraints.Select(x => x.ReferencedTableName) ) );
 
             foreach (TableInfo table in tables)
             {
