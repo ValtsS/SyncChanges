@@ -8,10 +8,10 @@ namespace SyncChanges
         public TableInfo Table { get; set; }
         public long Version { get; set; }
         public long CreationVersion { get; set; }
+        public long MergedVersion { get { return CreationVersion == 0 ? Version : CreationVersion; } }
         public char Operation { get; set; }
         public Dictionary<string, object> Keys { get; private set; } = new Dictionary<string, object>();
         public Dictionary<string, object> Others { get; private set; } = new Dictionary<string, object>();
-        public Dictionary<ForeignKeyConstraint, long> ForeignKeyConstraintsToDisable { get; private set; } = new Dictionary<ForeignKeyConstraint, long>();
 
         public object[] GetValues() => Keys.Values.Concat(Others.Values).ToArray();
 

@@ -4,6 +4,7 @@ using NLog;
 using NPoco;
 using System;
 using System.Collections.Generic;
+using System.Data;
 using System.Data.Common;
 using System.Linq;
 using System.Security.Cryptography;
@@ -524,43 +525,53 @@ namespace SyncChanges
                     Log.Info($"Replicating {"change".ToQuantity(changeInfo.Changes.Count)} to destination {destination.Name}");
 
                     using var db = GetDatabase(destination.ConnectionString, DatabaseType.SqlServer2005);
-                    using (var transaction = db.GetTransaction(System.Data.IsolationLevel.ReadUncommitted))
+                    using (var transaction = db.GetTransaction(System.Data.IsolationLevel.ReadCommitted))
                     {
 
+                        var existingDestConstraints = new HashSet<string>(GetAllConstraints(db).Select(e => e.FullName));
+                        
                         try
                         {
                             var changes = changeInfo.Changes;
-                            var disabledForeignKeyConstraints = new Dictionary<ForeignKeyConstraint, long>();
+                            var disabledForeignKeyConstraints = new HashSet<ForeignKeyConstraint>();
 
-                            for (int i = 0; i < changes.Count; i++)
+
+                            try
                             {
-                                var change = changes[i];
-                                Log.Debug($"Replicating change #{i + 1} of {changes.Count} (Version {change.Version}, CreationVersion {change.CreationVersion})");
-
-                                foreach (var fk in change.ForeignKeyConstraintsToDisable)
+                                foreach (var change in changes)
                                 {
-                                    if (disabledForeignKeyConstraints.TryGetValue(fk.Key, out long untilVersion))
+                                    foreach (var key in change.Table.ForeignKeyConstraints)
                                     {
-                                        // FK is already disabled, check if it needs to be deferred further than currently planned
-                                        if (fk.Value > untilVersion)
-                                            disabledForeignKeyConstraints[fk.Key] = fk.Value;
-                                    }
-                                    else
-                                    {
-                                        DisableForeignKeyConstraint(db, fk.Key);
-                                        disabledForeignKeyConstraints[fk.Key] = fk.Value;
+                                        if (!existingDestConstraints.Contains(key.FullName))
+                                            continue;
+
+                                        if (!disabledForeignKeyConstraints.Contains(key))
+                                        {
+                                            DisableForeignKeyConstraint(db, key);
+                                            disabledForeignKeyConstraints.Add(key);
+                                        }
+
                                     }
                                 }
 
-                                PerformChange(db, change);
 
-                                if ((i + 1) >= changes.Count || changes[i + 1].CreationVersion > change.CreationVersion) // there may be more than one change with the same CreationVersion
+                                for (int i = 0; i < changes.Count; i++)
                                 {
-                                    foreach (var fk in disabledForeignKeyConstraints.Where(f => f.Value <= change.CreationVersion).Select(f => f.Key).ToList())
-                                    {
-                                        ReenableForeignKeyConstraint(db, fk);
-                                        disabledForeignKeyConstraints.Remove(fk);
-                                    }
+                                    var change = changes[i];
+                                    Log.Debug($"Replicating change #{i + 1} of {changes.Count} (Version {change.Version}, CreationVersion {change.CreationVersion})");
+                                    PerformChange(db, change);
+                                }
+
+                            }
+                            finally
+                            {
+                                foreach (var fk in disabledForeignKeyConstraints.ToArray())
+                                {
+                                    if (!existingDestConstraints.Contains(fk.FullName))
+                                        continue;
+
+                                    ReenableForeignKeyConstraint(db, fk);
+                                    disabledForeignKeyConstraints.Remove(fk);
                                 }
                             }
 
@@ -826,45 +837,19 @@ namespace SyncChanges
                     db.CompleteTransaction();
             }
 
-            changeInfo.Changes.AddRange(changes.OrderBy(c => c.Version).ThenBy(c => c.Table.Name));
-
+            changeInfo.Changes.AddRange(changes.OrderBy(c => c.MergedVersion).ThenBy(c => c.Operation).ThenBy(c => c.Table.Name));
             ComputeForeignKeyConstraintsToDisable(changeInfo);
-
             return changeInfo;
         }
 
 
         private void ComputeForeignKeyConstraintsToDisable(ChangeInfo changeInfo)
         {
-            var changes = changeInfo.Changes.OrderBy(c => c.CreationVersion).ThenBy(c => c.Table.Name).ToList();
-
-            for (int i = 0; i < changes.Count; i++)
+            changeInfo.InvolvedKeys.Clear();
+            foreach(var change in changeInfo.Changes)
             {
-                var change = changes[i];
-                if (change.CreationVersion < change.Version) // was inserted then later updated
-                {
-                    for (int j = i + 1; j < changes.Count; j++)
-                    {
-                        var intermediateChange = changes[j];
-                        if (intermediateChange.CreationVersion > change.Version) // created later than last update to change
-                            break;
-                        if (intermediateChange.Operation != 'I') continue;
-
-                        // let's look at intermediateChange if it collides with change
-                        foreach (var fk in change.Table.ForeignKeyConstraints.Where(f => f.ReferencedTableName == intermediateChange.Table.Name))
-                        {
-                            var val = change.GetValue(fk.ColumnName);
-                            var refVal = intermediateChange.GetValue(fk.ReferencedColumnName);
-                            if (val != null && val.Equals(refVal))
-                            {
-                                // this foreign key constraint needs to be disabled
-                                Log.Info($"Foreign key constraint {fk.ForeignKeyName} needs to be disabled for change #{i + 1} from version {change.CreationVersion} until version {intermediateChange.CreationVersion}");
-                                change.ForeignKeyConstraintsToDisable[fk] = intermediateChange.CreationVersion;
-                            }
-                        }
-                    }
-                }
-            }
+                changeInfo.InvolvedKeys.AddRange(change.Table.ForeignKeyConstraints);
+            }            
         }
 
         private void PerformChange(Database db, Change change)
