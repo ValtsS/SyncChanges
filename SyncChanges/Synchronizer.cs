@@ -169,6 +169,8 @@ namespace SyncChanges
 
             if (!Initialized) Init();
 
+            Dictionary<ReplicationSet, DateTime> delayUntil = new();
+
             while (true)
             {
                 if (token.IsCancellationRequested)
@@ -183,6 +185,12 @@ namespace SyncChanges
                 for (int i = 0; i < Config.ReplicationSets.Count; i++)
                 {
                     var replicationSet = Config.ReplicationSets[i];
+
+                    if (delayUntil.TryGetValue(replicationSet, out DateTime dt) && dt > DateTime.UtcNow)
+                        continue;
+
+                    var defaultDelay = DateTime.UtcNow.AddSeconds(replicationSet.Interval ?? Interval);
+
                     var currentVersion = currentVersions[i];
                     long version = 0;
 
@@ -213,6 +221,9 @@ namespace SyncChanges
                     }
 #pragma warning restore CA1031 // Do not catch general exception types
 
+                    Log.Debug($"Replication set {replicationSet.Name} update is deferred until {defaultDelay}.");
+                    delayUntil[replicationSet] = defaultDelay;
+
                     if (token.IsCancellationRequested)
                     {
                         Log.Info("Stopping replication.");
@@ -220,10 +231,11 @@ namespace SyncChanges
                     }
                 }
 
-                Log.Info($"Finished replication {(Error ? "with" : "without")} errors");
-
-                var delay = (int)Math.Round(Math.Max(0, (TimeSpan.FromSeconds(Interval) - (DateTime.UtcNow - start)).TotalSeconds) * 1000, MidpointRounding.AwayFromZero);
-                Thread.Sleep(delay);
+            
+                if (Error)
+                    Log.Info($"Finished replication {(Error ? "with" : "without")} errors");
+            
+                Thread.Sleep(1000);
             }
         }
 

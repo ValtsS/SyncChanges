@@ -60,6 +60,11 @@ namespace SyncChanges
         /// Used for first sync when the option of backup and restore is not possible.
         /// </summary>
         public bool? ForceFullReload { get; set; }
+        /// <summary>
+        /// Interval in seconds for refresh
+        /// </summary>
+        public int? Interval { get; set; }
+
     }
 
     /// <summary>
