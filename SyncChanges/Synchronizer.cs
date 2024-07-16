@@ -4,11 +4,7 @@ using NLog;
 using NPoco;
 using System;
 using System.Collections.Generic;
-using System.Data;
-using System.Data.Common;
 using System.Linq;
-using System.Security.Cryptography;
-using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -51,6 +47,12 @@ namespace SyncChanges
         static readonly Logger Log = LogManager.GetCurrentClassLogger();
         Config Config { get; set; }
         bool Error { get; set; }
+
+        private static readonly Dictionary<string, string> PermissiveTypeMap = new Dictionary<string, string>
+        {
+            { "189;189;8;0;0;1;0", "173;173;8;0;0;1;0" },
+            { "173;173;8;0;0;1;0", "189;189;8;0;0;1;0" },
+        };
 
         /// <summary>
         /// Initializes a new instance of the <see cref="Synchronizer"/> class.
@@ -96,6 +98,63 @@ namespace SyncChanges
             Initialized = true;
         }
 
+
+        Dictionary<string, TableInfo> MapTableInfo(IEnumerable<TableInfo> tables)
+        {
+            return tables.ToDictionary(t => t.Name.Replace("[", "").Replace("]", ""), t => t);
+        }
+
+        bool SchemaChanged(IList<TableInfo> tablesNew, IList<TableInfo> tables, IEnumerable<string> interestingTables)
+        {
+
+            var newtables = MapTableInfo(tablesNew);
+            var oldtables = MapTableInfo(tables);
+
+            foreach(var tableName in interestingTables)
+            {
+                if (newtables.TryGetValue(tableName, out TableInfo newTable) &&
+                    oldtables.TryGetValue(tableName, out TableInfo oldTable))
+                {
+
+                    if (newTable.ColumnTypeDescriptions.Count != oldTable.ColumnTypeDescriptions.Count)
+                    {
+                        Log.Error($"Column count mismatch in table {tableName}");
+                        return true;
+                    }
+
+                    bool mismatches = false;
+                    foreach(var kv in oldTable.ColumnTypeDescriptions)
+                    {
+                        if (newTable.ColumnTypeDescriptions.TryGetValue(kv.Key, out string newDesc))
+                        {
+                            if (newDesc != kv.Value)
+                            {
+                                if (PermissiveTypeMap.TryGetValue(newDesc, out string alsoValid) && alsoValid == kv.Value)
+                                    continue; // rowversion cannot be mapped exactly
+
+                                Log.Error($"Column type mismatch in table {tableName} column {kv.Key}");
+                                mismatches = true;
+                            }
+                        } else {
+                            Log.Error($"Column {kv.Key} not found in table {tableName}");
+                            mismatches = true;
+                        }
+                    }
+
+                    return mismatches;
+
+                } else
+                {
+                    Log.Error($"Could not locate required table {tableName} in source and/or destination database");
+                    return true;
+                }
+
+            }
+
+            return false;
+
+        }
+
         /// <summary>
         /// Perform the synchronization.
         /// </summary>
@@ -132,6 +191,14 @@ namespace SyncChanges
 
             foreach( var d in replicationSet.Destinations)
             {
+
+                var destTables = GetTables(d, false);
+
+                if (SchemaChanged(destTables, tables, replicationSet.Tables ))
+                {
+                    return false;
+                }
+
                 var verData = GetCurrentVersion(d, tables.Select(x => x.Name).ToArray()).Select(kv => $"{kv.Key}:{kv.Value};").ToList();
                 verData.Sort();
                 var dstring = String.Join("", verData);
@@ -158,6 +225,9 @@ namespace SyncChanges
 
             return !Error;
         }
+
+
+
 
         /// <summary>
         /// Performs synchronization in an infinite loop. Periodically checks if source version has increased to trigger replication.
@@ -197,20 +267,27 @@ namespace SyncChanges
                     try
                     {
                         using (var db = GetDatabase(replicationSet.Source.ConnectionString, DatabaseType.SqlServer2008))
+                        {
                             version = db.ExecuteScalar<long>("select CHANGE_TRACKING_CURRENT_VERSION()");
 
-                        Log.Debug($"Current version of source in replication set {replicationSet.Name} is {version}.");
+                            Log.Debug($"Current version of source in replication set {replicationSet.Name} is {version}.");
 
-                        if (version > currentVersion)
-                        {
-                            Log.Info($"Current version of source in replication set {replicationSet.Name} has increased from {currentVersion} to {version}: Starting replication.");
+                            if (version > currentVersion)
+                            {
+                                
+                                var tables = Tables[i];
+                                if (SchemaChanged(GetTablesEx(db), tables, replicationSet.Tables))
+                                {
+                                    throw new InvalidOperationException($"Schema change detected in {replicationSet.Name}");
+                                }
 
-                            var tables = Tables[i];
-                            var success = Sync(replicationSet, tables, false, version);
+                                Log.Info($"Current version of source in replication set {replicationSet.Name} has increased from {currentVersion} to {version}: Starting replication.");
+                                var success = Sync(replicationSet, tables, false, version);
 
-                            if (success) currentVersions[i] = version;
+                                if (success) currentVersions[i] = version;
 
-                            Synced?.Invoke(this, new SyncEventArgs { ReplicationSet = replicationSet, Version = version });
+                                Synced?.Invoke(this, new SyncEventArgs { ReplicationSet = replicationSet, Version = version });
+                            }
                         }
                     }
 #pragma warning disable CA1031 // Do not catch general exception types
@@ -239,23 +316,35 @@ namespace SyncChanges
             }
         }
 
-        private IList<TableInfo> GetTables(DatabaseInfo dbInfo)
+        private IList<TableInfo> GetTablesEx(Database db, bool onlyTracked = true)
         {
             try
             {
-                using var db = GetDatabase(dbInfo.ConnectionString, DatabaseType.SqlServer2008);
+                var trackWhere = onlyTracked ? @"and tr.object_id is not null" : "";
+
                 var sql = @"select TableName, ColumnName, coalesce(max(cast(is_primary_key as tinyint)), 0) PrimaryKey,
-                        coalesce(max(cast(is_identity as tinyint)), 0) IsIdentity from
+                        coalesce(max(cast(is_identity as tinyint)), 0) IsIdentity,
+						max(X.TypeDescription) as TypeDescription from
                         (
                         select ('[' + s.name + '].[' + t.name + ']') TableName, ('[' + COL_NAME(t.object_id, a.column_id) + ']') ColumnName,
-                        i.is_primary_key, a.is_identity
-                        from sys.change_tracking_tables tr
-                        join sys.tables t on t.object_id = tr.object_id
+                        i.is_primary_key, a.is_identity,
+
+						cast(a.system_type_id as varchar(48)) +';'+
+						cast(a.user_type_id as varchar(48)) +';'+
+						cast(a.max_length as varchar(48)) +';'+
+						cast(a.precision as varchar(48)) +';'+
+						cast(a.scale as varchar(48)) +';'+
+						cast(a.is_nullable as varchar(48)) +';'+
+						cast(a.is_identity as varchar(48)) as TypeDescription
+
+                        from sys.tables t 
                         join sys.schemas s on s.schema_id = t.schema_id
                         join sys.columns a on a.object_id = t.object_id
                         left join sys.index_columns c on c.object_id = t.object_id and c.column_id = a.column_id
                         left join sys.indexes i on i.object_id = t.object_id and i.index_id = c.index_id
+						left join sys.change_tracking_tables tr on t.object_id = tr.object_id
                         where a.is_computed = 0
+						" + trackWhere + @"
                         ) X
                         group by TableName, ColumnName
                         order by TableName, ColumnName";
@@ -266,7 +355,8 @@ namespace SyncChanges
                         Name = (string)g.Key,
                         KeyColumns = g.Where(c => (int)c.PrimaryKey > 0).Select(c => (string)c.ColumnName).ToList(),
                         OtherColumns = g.Where(c => (int)c.PrimaryKey == 0).Select(c => (string)c.ColumnName).ToList(),
-                        HasIdentity = g.Any(c => (int)c.IsIdentity > 0)
+                        HasIdentity = g.Any(c => (int)c.IsIdentity > 0),
+                        ColumnTypeDescriptions = g.Select( c => ( (string) c.ColumnName , (string)c.TypeDescription) ).ToDictionary( x=> x.Item1, x=> x.Item2 )
                     }).ToList();
                 List<ForeignKeyConstraint> fks = GetAllEnabledConstraints(db);
 
@@ -313,6 +403,14 @@ namespace SyncChanges
             {
                 Log.Fatal(ex, "Error getting tables to replicate from source database");
                 throw;
+            }
+        }
+
+        private IList<TableInfo> GetTables(DatabaseInfo dbInfo, bool onlyTracked = true)
+        {
+            using (var db = GetDatabase(dbInfo.ConnectionString, DatabaseType.SqlServer2008))
+            {
+                return GetTablesEx(db, onlyTracked);
             }
         }
 
