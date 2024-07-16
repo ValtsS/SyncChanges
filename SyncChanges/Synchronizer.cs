@@ -170,7 +170,8 @@ namespace SyncChanges
                 var replicationSet = Config.ReplicationSets[i];
                 var tables = Tables[i];
 
-                Sync(replicationSet, tables, replicationSet.ForceFullReload.GetValueOrDefault(false));
+                if (!Sync(replicationSet, tables, replicationSet.ForceFullReload.GetValueOrDefault(false)))
+                    Error = true;
             }
 
             Log.Info($"Finished replication {(Error ? "with" : "without")} errors");
