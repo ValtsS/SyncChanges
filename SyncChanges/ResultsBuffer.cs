@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Data.Common;
+using System.Data.SqlTypes;
 using System.Text;
 
 namespace SyncChanges
@@ -19,7 +20,7 @@ namespace SyncChanges
         {
             object[] data = new object[columns.Length];
             for (int i = 0; i < data.Length; i++)
-                data[i] = reader.GetValue(i);
+                data[i] = reader.IsDBNull(i) ? SqlBinary.Null :  reader.GetValue(i);
 
             lines.Enqueue(data);
 
