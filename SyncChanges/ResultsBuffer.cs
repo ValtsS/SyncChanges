@@ -4,12 +4,14 @@ using System.Data.Common;
 using System.Data.SqlTypes;
 using System.Text;
 
+
 namespace SyncChanges
 {
     class ResultsBuffer
     {
         readonly string[] columns;
         readonly Queue<object[]> lines = new();
+        private object[] nullTypeMap = null;
 
         public ResultsBuffer(string[] columns)
         {
@@ -18,9 +20,20 @@ namespace SyncChanges
 
         public void ReadLine(DbDataReader reader)
         {
+            if (this.nullTypeMap == null)
+                this.nullTypeMap = reader.GetNullableTypeMap();
+
             object[] data = new object[columns.Length];
             for (int i = 0; i < data.Length; i++)
-                data[i] = reader.IsDBNull(i) ? SqlBinary.Null :  reader.GetValue(i);
+            {
+                var val = reader.GetValue(i);
+
+                if (val == DBNull.Value)
+                    data[i] = nullTypeMap[i] ?? val;
+                else
+                    data[i] = val;
+            }
+
 
             lines.Enqueue(data);
 
