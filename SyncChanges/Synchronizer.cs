@@ -104,7 +104,7 @@ namespace SyncChanges
             return tables.ToDictionary(t => t.Name.Replace("[", "").Replace("]", ""), t => t);
         }
 
-        bool SchemaChanged(IList<TableInfo> tablesNew, IList<TableInfo> tables, IEnumerable<string> interestingTables)
+        bool SchemaChanged(IList<TableInfo> tablesNew, IEnumerable<TableInfo> tables, IEnumerable<string> interestingTables)
         {
 
             var newtables = MapTableInfo(tablesNew);
@@ -179,7 +179,7 @@ namespace SyncChanges
             return !Error;
         }
 
-        private bool Sync(ReplicationSet replicationSet, IList<TableInfo> tables, bool fullReload = false,  long sourceVersion = -1)
+        private bool Sync(ReplicationSet replicationSet, IEnumerable<TableInfo> tables, bool fullReload = false,  long sourceVersion = -1)
         {
             Error = false;
 
@@ -211,7 +211,7 @@ namespace SyncChanges
 
             foreach (var destSet in byVersion)
             {
-                var versionData = GetCurrentVersion(destSet.Value[0], tables.Select(x => x.Name).ToArray());
+                var destVersionData = GetCurrentVersion(destSet.Value[0], tables.Select(x => x.Name).ToArray());
 
                 if (fullReload)
                 {
@@ -219,7 +219,7 @@ namespace SyncChanges
                         FullLoadReplicate(replicationSet.Source, dest, tables);
                 }
                 else
-                    Replicate(replicationSet.Source, destSet.Value, versionData, tables);
+                    Replicate(replicationSet.Source, destSet.Value, destVersionData, tables);
 
 
             }
@@ -282,7 +282,7 @@ namespace SyncChanges
                                     throw new InvalidOperationException($"Schema change detected in {replicationSet.Name}");
                                 }
 
-                                Log.Info($"Current version of source in replication set {replicationSet.Name} has increased from {currentVersion} to {version}: Starting replication.");
+                                Log.Info($"Current version of source in replication set {replicationSet.Name} has increased from {currentVersion} to {version}: Starting replication. Table count in replication: {tables.Count}");
                                 var success = Sync(replicationSet, tables, false, version);
 
                                 if (success) currentVersions[i] = version;
@@ -514,7 +514,7 @@ namespace SyncChanges
             }
         }
 
-        private void FullLoadReplicate(DatabaseInfo source, DatabaseInfo destination, IList<TableInfo> tables)
+        private void FullLoadReplicate(DatabaseInfo source, DatabaseInfo destination, IEnumerable<TableInfo> tables)
         {
 
             using var dbDest = GetDatabase(destination.ConnectionString, DatabaseType.SqlServer2005);
@@ -558,7 +558,7 @@ namespace SyncChanges
             }
         }
 
-        private void TransferAllTables(IList<TableInfo> tables, Database dbDest, Database dbSrc, List<ForeignKeyConstraint> destForeignKeyConstraints)
+        private void TransferAllTables(IEnumerable<TableInfo> tables, Database dbDest, Database dbSrc, List<ForeignKeyConstraint> destForeignKeyConstraints)
         {
             var tablesWithFK = new HashSet<string>(destForeignKeyConstraints.Select(x => x.TableName).Union(destForeignKeyConstraints.Select(x => x.ReferencedTableName) ) );
 
@@ -602,7 +602,7 @@ namespace SyncChanges
             }
         }
 
-        private static void VerifyChangeTrackingPresence(IList<TableInfo> tables, Database dbSrc)
+        private static void VerifyChangeTrackingPresence(IEnumerable<TableInfo> tables, Database dbSrc)
         {
             foreach (TableInfo table in tables)
             {
@@ -623,9 +623,9 @@ namespace SyncChanges
                 throw new Exception($"Saver failed {saver.Exception}");
         }
 
-        private void Replicate(DatabaseInfo source, List<DatabaseInfo> destinations, Dictionary<string, long> versions, IList<TableInfo> tables)
+        private void Replicate(DatabaseInfo source, List<DatabaseInfo> destinations, Dictionary<string, long> destVersions, IEnumerable<TableInfo> tables)
         {
-            var changeInfo = RetrieveChangesEx(source, versions, tables);
+            var changeInfo = RetrieveChanges(source, destVersions, tables);
             if (changeInfo == null) return;
 
             // replicate changes to destinations
@@ -750,10 +750,13 @@ namespace SyncChanges
                 {
                     db.Execute("update SyncInfo set Version = @0, TablesList = @1", currentVersion, SerializeList(tables));
                 }
+
+                Log.Info($"Set syncinfo to be version {currentVersion} for {tables.Length} tables");
+
             }
         }
 
-        private ChangeInfo RetrieveChangesEx(DatabaseInfo source, Dictionary<string, long> versions, IList<TableInfo> tables)
+        private ChangeInfo RetrieveChanges(DatabaseInfo source, Dictionary<string, long> versions, IEnumerable<TableInfo> tables)
         {
 
             var changeInfo = new ChangeInfo();
@@ -791,7 +794,6 @@ namespace SyncChanges
                     if (loadFull)
                     {
                         Log.Warn($"Cannot replicate table {tableName} because minimum source version {minVersion} is greater than destination version {destinationVersion}. Attempting full load!");
-                        loadFull = true;
                     }
 
                     string sql;
@@ -859,11 +861,28 @@ namespace SyncChanges
 
                         }
 
-                        changes.Add(change);
-                        numChanges++;
+                        if (change.CreationVersion > changeInfo.Version || change.Version > changeInfo.Version)
+                        {
+                            Log.Warn($"Snapshot seems suspect, got version {change.MergedVersion} while expecing maximum as {changeInfo.Version}");
+                        }
+                        else
+                        {
+                            changes.Add(change);
+                            numChanges++;
+                        }
                     }
 
                     Log.Info($"Table {tableName} has {"change".ToQuantity(numChanges)}");
+                }
+
+
+                var verifyVersion = db.ExecuteScalar<long>("select CHANGE_TRACKING_CURRENT_VERSION()");
+
+                if (verifyVersion != changeInfo.Version)
+                {
+                    Log.Error($"Snapshot did not work, version changed while we were fetching data!");
+                    Error = true;
+                    return null;
                 }
 
                 if (snapshotIsolationEnabled)
