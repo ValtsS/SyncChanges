@@ -1,4 +1,6 @@
 ﻿using Humanizer;
+using Medallion.Threading;
+using Medallion.Threading.SqlServer;
 using Newtonsoft.Json;
 using NLog;
 using NPoco;
@@ -211,6 +213,7 @@ namespace SyncChanges
 
             foreach (var destSet in byVersion)
             {
+
                 var destVersionData = GetCurrentVersion(destSet.Value[0], tables.Select(x => x.Name).ToArray());
 
                 if (fullReload)
@@ -527,35 +530,49 @@ namespace SyncChanges
                 return;
             }
 
+            var dlock = CreateSQLLock(destination.ConnectionString);
 
-            using (var transSrc = dbSrc.GetTransaction(System.Data.IsolationLevel.Snapshot))
+            using (var handle = dlock.TryAcquire())
             {
-                var currentVer = dbSrc.ExecuteScalar<long>("select CHANGE_TRACKING_CURRENT_VERSION()");
-                Log.Info($"Current version of database {source.Name} is {currentVer}");
-
-                VerifyChangeTrackingPresence(tables, dbSrc);
-
-                var involvedTables = new HashSet<string>(tables.Select(t => t.Name));
-                var destConstraints = GetAllConstraints(dbDest).ToList();
-                var constraintsToDisable = GetAllEnabledConstraints(dbDest).Where(c => (involvedTables.Contains(c.TableName) || involvedTables.Contains(c.ReferencedTableName)) && c.IsDisabled != 1).ToList();
-
-                ToggleForgeignConstraints(dbDest, constraintsToDisable, false);
-                try
+                if (handle != null)
                 {
-                    TransferAllTables(tables, dbDest, dbSrc, destConstraints);
-                    SetSyncVersion(dbDest, currentVer, tables.Select(x => x.Name).ToArray());
-                }
-                catch (Exception ex)
+
+                    using (var transSrc = dbSrc.GetTransaction(System.Data.IsolationLevel.Snapshot))
+                    {
+                        var currentVer = dbSrc.ExecuteScalar<long>("select CHANGE_TRACKING_CURRENT_VERSION()");
+                        Log.Info($"Current version of database {source.Name} is {currentVer}");
+
+                        VerifyChangeTrackingPresence(tables, dbSrc);
+
+                        var involvedTables = new HashSet<string>(tables.Select(t => t.Name));
+                        var destConstraints = GetAllConstraints(dbDest).ToList();
+                        var constraintsToDisable = GetAllEnabledConstraints(dbDest).Where(c => (involvedTables.Contains(c.TableName) || involvedTables.Contains(c.ReferencedTableName)) && c.IsDisabled != 1).ToList();
+
+                        ToggleForgeignConstraints(dbDest, constraintsToDisable, false);
+                        try
+                        {
+                            TransferAllTables(tables, dbDest, dbSrc, destConstraints);
+                            SetSyncVersion(dbDest, currentVer, tables.Select(x => x.Name).ToArray());
+                        }
+                        catch (Exception ex)
+                        {
+                            Log.Error(ex, $"Full re-load failed, you will likely need to re-start from scratch. Destination {destination.Name} state uncertain");
+                            Error = true;
+                        }
+                        finally
+                        {
+                            ToggleForgeignConstraints(dbDest, constraintsToDisable, true);
+                        }
+
+                    }
+
+                } else
                 {
-                    Log.Error(ex, $"Full re-load failed, you will likely need to re-start from scratch. Destination {destination.Name} state uncertain");
+                    Log.Error($"Could not get lock on destination database {destination.Name}");
                     Error = true;
                 }
-                finally
-                {
-                    ToggleForgeignConstraints(dbDest, constraintsToDisable, true);
-                }
-
             }
+
         }
 
         private void TransferAllTables(IEnumerable<TableInfo> tables, Database dbDest, Database dbSrc, List<ForeignKeyConstraint> destForeignKeyConstraints)
@@ -629,89 +646,106 @@ namespace SyncChanges
             if (changeInfo == null) return;
 
             // replicate changes to destinations
-            foreach(var destination in destinations)
+            foreach (var destination in destinations)
             {
-                try
+                SqlDistributedLock dlock = CreateSQLLock(destination.ConnectionString);
+                using (var handle = dlock.TryAcquire())
                 {
-                    Log.Info($"Replicating {"change".ToQuantity(changeInfo.Changes.Count)} to destination {destination.Name}");
-
-                    using var db = GetDatabase(destination.ConnectionString, DatabaseType.SqlServer2005);
-                    using (var transaction = db.GetTransaction(System.Data.IsolationLevel.ReadCommitted))
+                    if (handle == null)
                     {
+                        Log.Error($"Could not get destination lock on {destination.Name}");
+                        continue;
+                    }
 
-                        var existingDestConstraints = new HashSet<string>(GetAllConstraints(db).Select(e => e.FullName));
+                    try
+                    {
+                        Log.Info($"Replicating {"change".ToQuantity(changeInfo.Changes.Count)} to destination {destination.Name}");
 
-                        try
+                        using var db = GetDatabase(destination.ConnectionString, DatabaseType.SqlServer2005);
+                        using (var transaction = db.GetTransaction(System.Data.IsolationLevel.ReadCommitted))
                         {
-                            var changes = changeInfo.Changes;
-                            var disabledForeignKeyConstraints = new HashSet<ForeignKeyConstraint>();
 
+                            var existingDestConstraints = new HashSet<string>(GetAllConstraints(db).Select(e => e.FullName));
 
                             try
                             {
-                                foreach (var change in changes)
+                                var changes = changeInfo.Changes;
+                                var disabledForeignKeyConstraints = new HashSet<ForeignKeyConstraint>();
+
+
+                                try
                                 {
-                                    foreach (var key in change.Table.ForeignKeyConstraints)
+                                    foreach (var change in changes)
                                     {
-                                        if (!existingDestConstraints.Contains(key.FullName))
+                                        foreach (var key in change.Table.ForeignKeyConstraints)
+                                        {
+                                            if (!existingDestConstraints.Contains(key.FullName))
+                                                continue;
+
+                                            if (!disabledForeignKeyConstraints.Contains(key))
+                                            {
+                                                DisableForeignKeyConstraint(db, key);
+                                                disabledForeignKeyConstraints.Add(key);
+                                            }
+
+                                        }
+                                    }
+
+
+                                    for (int i = 0; i < changes.Count; i++)
+                                    {
+                                        var change = changes[i];
+                                        Log.Debug($"Replicating change #{i + 1} of {changes.Count} (Version {change.Version}, CreationVersion {change.CreationVersion})");
+                                        PerformChange(db, change);
+                                    }
+
+                                }
+                                finally
+                                {
+                                    foreach (var fk in disabledForeignKeyConstraints.ToArray())
+                                    {
+                                        if (!existingDestConstraints.Contains(fk.FullName))
                                             continue;
 
-                                        if (!disabledForeignKeyConstraints.Contains(key))
-                                        {
-                                            DisableForeignKeyConstraint(db, key);
-                                            disabledForeignKeyConstraints.Add(key);
-                                        }
-
+                                        ReenableForeignKeyConstraint(db, fk);
+                                        disabledForeignKeyConstraints.Remove(fk);
                                     }
                                 }
 
-
-                                for (int i = 0; i < changes.Count; i++)
+                                if (!DryRun)
                                 {
-                                    var change = changes[i];
-                                    Log.Debug($"Replicating change #{i + 1} of {changes.Count} (Version {change.Version}, CreationVersion {change.CreationVersion})");
-                                    PerformChange(db, change);
+                                    SetSyncVersion(db, changeInfo.Version, tables.Select(x => x.Name).ToArray());
+                                    transaction.Complete();
                                 }
 
+                                Log.Info($"Destination {destination.Name} now at version {changeInfo.Version}");
                             }
-                            finally
-                            {
-                                foreach (var fk in disabledForeignKeyConstraints.ToArray())
-                                {
-                                    if (!existingDestConstraints.Contains(fk.FullName))
-                                        continue;
-
-                                    ReenableForeignKeyConstraint(db, fk);
-                                    disabledForeignKeyConstraints.Remove(fk);
-                                }
-                            }
-
-                            if (!DryRun)
-                            {
-                                SetSyncVersion(db, changeInfo.Version, tables.Select(x => x.Name).ToArray());
-                                transaction.Complete();
-                            }
-
-                            Log.Info($"Destination {destination.Name} now at version {changeInfo.Version}");
-                        }
 #pragma warning disable CA1031 // Do not catch general exception types
-                        catch (Exception ex)
-                        {
-                            Error = true;
-                            Log.Error(ex, $"Error replicating changes to destination {destination.Name}");
-                        }
+                            catch (Exception ex)
+                            {
+                                Error = true;
+                                Log.Error(ex, $"Error replicating changes to destination {destination.Name}");
+                            }
 #pragma warning restore CA1031 // Do not catch general exception types
+                        }
                     }
-                }
 #pragma warning disable CA1031 // Do not catch general exception types
-                catch (Exception ex)
-                {
-                    Error = true;
-                    Log.Error(ex, $"Error replicating changes to destination {destination.Name}");
-                }
+                    catch (Exception ex)
+                    {
+                        Error = true;
+                        Log.Error(ex, $"Error replicating changes to destination {destination.Name}");
+                    }
 #pragma warning restore CA1031 // Do not catch general exception types
+
+                }
+
 
             }
+        }
+
+        private static SqlDistributedLock CreateSQLLock(string ConnectionString)
+        {
+            return new SqlDistributedLock("SyncChangesLock", ConnectionString);
         }
 
         private void ReenableForeignKeyConstraint(Database db, ForeignKeyConstraint fk)
