@@ -929,7 +929,7 @@ namespace SyncChanges
                     break;
                 // Truncate - actually artificial for full re-load
                 case 'T':
-                    var truncateSql = string.Format("truncate table {0}", tableName);
+                    var truncateSql = string.Format("delete from {0}", tableName);
                     Log.Debug($"Executing truncate: {truncateSql}");
                     if (!DryRun)
                         db.Execute(truncateSql);
