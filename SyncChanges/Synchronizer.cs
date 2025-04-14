@@ -6,7 +6,9 @@ using NLog;
 using NPoco;
 using System;
 using System.Collections.Generic;
+using System.Data.Common;
 using System.Linq;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -452,7 +454,22 @@ namespace SyncChanges
 
         private Database GetDatabase(string connectionString, DatabaseType databaseType = null)
         {
-            var db = new Database(connectionString, databaseType ?? DatabaseType.SqlServer2005, System.Data.SqlClient.SqlClientFactory.Instance);
+
+            bool requiresMicrosoftProvider = Regex.IsMatch(connectionString, @"\bAuthentication\s*=", RegexOptions.IgnoreCase);
+
+            Database db = null;
+
+            if (requiresMicrosoftProvider)
+            {
+                var connection = new Microsoft.Data.SqlClient.SqlConnection(connectionString);
+                connection.Open();
+                db = new Database(connection, databaseType ?? DatabaseType.SqlServer2005);                
+
+            } else
+            {
+                db = new Database(connectionString, databaseType ?? DatabaseType.SqlServer2005, System.Data.SqlClient.SqlClientFactory.Instance);
+
+            }
 
             if (Timeout != 0) db.CommandTimeout = Timeout;
 
