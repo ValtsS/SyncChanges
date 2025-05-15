@@ -920,6 +920,9 @@ namespace SyncChanges
                         {
                             changes.Add(change);
                             numChanges++;
+                            if (numChanges % 10000 == 0)
+                                Log.Info($"{numChanges} changes retrieved...");
+                                     
                         }
                     }
 

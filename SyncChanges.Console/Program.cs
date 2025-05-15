@@ -18,7 +18,7 @@ namespace SyncChanges.Console
         List<string> ConfigFiles;
         bool DryRun;
         bool Error = false;
-        int Timeout = 0;
+        int Timeout = 9600;
         bool Loop = false;
         int Interval = 30;
 
