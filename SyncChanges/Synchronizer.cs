@@ -463,7 +463,7 @@ namespace SyncChanges
             {
                 var connection = new Microsoft.Data.SqlClient.SqlConnection(connectionString);
                 connection.Open();
-                db = new Database(connection, databaseType ?? DatabaseType.SqlServer2005);                
+                db = new Database(connection, databaseType ?? DatabaseType.SqlServer2005);
 
             } else
             {
@@ -922,7 +922,7 @@ namespace SyncChanges
                             numChanges++;
                             if (numChanges % 10000 == 0)
                                 Log.Info($"{numChanges} changes retrieved...");
-                                     
+
                         }
                     }
 
@@ -1005,7 +1005,17 @@ namespace SyncChanges
                     var truncateSql = string.Format("delete from {0}", tableName);
                     Log.Debug($"Executing truncate: {truncateSql}");
                     if (!DryRun)
-                        db.Execute(truncateSql);
+                    {
+                        int saved = db.CommandTimeout;
+                        try
+                        {
+                            db.Execute(truncateSql);
+                        }
+                        finally
+                        {
+                            db.CommandTimeout = saved;
+                        }
+                    }
 
                     break;
             }
