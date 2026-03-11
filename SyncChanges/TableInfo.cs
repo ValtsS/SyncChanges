@@ -11,6 +11,7 @@ namespace SyncChanges
         public IList<UniqueConstraint> UniqueConstraints { get; set; }
         public bool HasIdentity { get; set; }
         public Dictionary<string, string> ColumnTypeDescriptions { get; set; }
+        public Dictionary<string,int> ColumnTypes = new();
 
     }
 }

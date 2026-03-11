@@ -330,7 +330,9 @@ namespace SyncChanges
 
                 var sql = @"select TableName, ColumnName, coalesce(max(cast(is_primary_key as tinyint)), 0) PrimaryKey,
                         coalesce(max(cast(is_identity as tinyint)), 0) IsIdentity,
-						max(X.TypeDescription) as TypeDescription from
+						max(X.TypeDescription) as TypeDescription,
+                        max(system_type_id) as system_type_id
+                        from
                         (
                         select ('[' + s.name + '].[' + t.name + ']') TableName, ('[' + COL_NAME(t.object_id, a.column_id) + ']') ColumnName,
                         i.is_primary_key, a.is_identity,
@@ -341,7 +343,8 @@ namespace SyncChanges
 						cast(a.precision as varchar(48)) +';'+
 						cast(a.scale as varchar(48)) +';'+
 						cast(a.is_nullable as varchar(48)) +';'+
-						cast(a.is_identity as varchar(48)) as TypeDescription
+						cast(a.is_identity as varchar(48)) as TypeDescription,
+                        a.system_type_id as system_type_id
 
                         from sys.tables t 
                         join sys.schemas s on s.schema_id = t.schema_id
@@ -362,7 +365,8 @@ namespace SyncChanges
                         KeyColumns = g.Where(c => (int)c.PrimaryKey > 0).Select(c => (string)c.ColumnName).ToList(),
                         OtherColumns = g.Where(c => (int)c.PrimaryKey == 0).Select(c => (string)c.ColumnName).ToList(),
                         HasIdentity = g.Any(c => (int)c.IsIdentity > 0),
-                        ColumnTypeDescriptions = g.Select( c => ( (string) c.ColumnName , (string)c.TypeDescription) ).ToDictionary( x=> x.Item1, x=> x.Item2 )
+                        ColumnTypeDescriptions = g.Select( c => ( (string) c.ColumnName , (string)c.TypeDescription) ).ToDictionary( x=> x.Item1, x=> x.Item2 ),
+                        ColumnTypes = g.Select(c => ((string)c.ColumnName, (int)c.system_type_id)).ToDictionary(x => x.Item1, x => x.Item2)                        
                     }).ToList();
                 List<ForeignKeyConstraint> fks = GetAllEnabledConstraints(db);
 
@@ -969,10 +973,22 @@ namespace SyncChanges
                 // Insert
                 case 'I':
                     var insertColumnNames = change.GetColumnNames();
+
+                    var valuePlaceholders = insertColumnNames.Select((c, i) =>
+                    {
+                        if (change.Table.ColumnTypes.TryGetValue(c, out var typeId) && typeId == 0xA5)
+                        {
+                            return $"cast(@{i} as varbinary(max))";
+                        }
+                        return $"@{i}";
+                    });
+
                     var insertSql = string.Format("insert into {0} ({1}) values ({2})", tableName,
-                        string.Join(", ", insertColumnNames),
-                        string.Join(", ", Parameters(insertColumnNames.Count)));
+                            string.Join(", ", insertColumnNames),
+                            string.Join(", ", valuePlaceholders));
+
                     var insertValues = change.GetValues();
+
                     if (table.HasIdentity)
                         insertSql = $"set IDENTITY_INSERT {tableName} ON; {insertSql}; set IDENTITY_INSERT {tableName} OFF";
                     Log.Debug($"Executing insert: {insertSql} ({FormatArgs(insertValues)})");
@@ -984,7 +1000,18 @@ namespace SyncChanges
                 case 'U':
                     var updateColumnNames = change.Others.Keys.ToList();
                     var updateSql = string.Format("update {0} set {1} where {2}", tableName,
-                        string.Join(", ", updateColumnNames.Select((c, i) => $"{c} = @{i + change.Keys.Count}")),
+                        string.Join(", ", updateColumnNames.Select((c, i) =>
+                            {
+                                switch (change.Table.ColumnTypes[c])
+                                {
+                                    case 0xA5:
+                                        return $"{c} = cast(@{i + change.Keys.Count} as varbinary(max))";
+                                    default:
+                                        return $"{c} = @{i + change.Keys.Count}";
+                                }                                
+                            }                        
+                        )                      
+                        ),
                         PrimaryKeys(change));
                     var updateValues = change.GetValues();
                     Log.Debug($"Executing update: {updateSql} ({FormatArgs(updateValues)})");
