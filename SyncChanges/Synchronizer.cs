@@ -1061,7 +1061,7 @@ namespace SyncChanges
 
             foreach(var t in TablesList)
             {
-                answer[t] = 0;
+                answer[t] = -1;
             }
 
             try
@@ -1072,7 +1072,7 @@ namespace SyncChanges
 
                 if (!syncInfoTableExists)
                 {
-                    Log.Info($"SyncInfo table does not exist in database {dbInfo.Name}, assuming version 0");
+                    Log.Info($"SyncInfo table does not exist in database {dbInfo.Name}, assuming version -1");
                 }
                 else
                 {
